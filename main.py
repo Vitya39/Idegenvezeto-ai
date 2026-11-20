@@ -2,7 +2,7 @@ from building_recognition import recognize_building
 from location import get_image_coordinates
 
 if __name__ == "__main__":
-    image_path = "kepek/test3.jpg"
+    image_path = "kepek/test2.jpg"
     coords = get_image_coordinates(image_path)
     if coords:
         lat, lon = coords
