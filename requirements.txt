@@ -1,0 +1,11 @@
+torch
+transformers
+accelerate
+bitsandbytes
+qwen-vl-utils
+Pillow
+openai-whisper
+pydantic>=2.0
+pytest
+librosa
+gradio

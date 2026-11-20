@@ -1,8 +1,9 @@
 import sqlite3
 
-def create_and_populate_db():
+def create_and_populate_db(db_path: str = "tourism.db") -> None:
+    """Létrehozza és feltölti az SQLite adatbázist az alapértelmezett turisztikai helyszínekkel."""
     # Kapcsolódás az adatbázishoz
-    conn = sqlite3.connect('tourism.db')
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
     # Tábla létrehozása

@@ -1,5 +1,4 @@
 import json
-import math
 import re
 import sqlite3
 import warnings
@@ -7,15 +6,11 @@ import warnings
 from PIL import Image
 from qwen_vl_utils import process_vision_info
 import torch
-from transformers import (
-    AutoProcessor,
-    BitsAndBytesConfig,
-    Qwen2_5_VLForConditionalGeneration,
-    logging as hf_logging,
-)
+from transformers import logging as hf_logging
 
 from database import create_and_populate_db
 from location import get_image_coordinates
+from validator import haversine_distance
 
 warnings.filterwarnings("ignore", category=UserWarning)
 hf_logging.set_verbosity_error()
@@ -30,36 +25,11 @@ _vision_processor = None
 
 
 def _load_vision_model():
-    """Lazy-load Qwen2.5-VL-3B-Instruct model and processor."""
+    """Lazy-load Qwen2.5-VL-3B-Instruct model and processor via shared singleton."""
     global _vision_model, _vision_processor
-    if _vision_model is not None and _vision_processor is not None:
-        return _vision_model, _vision_processor
+    from llm_service import load_qwen_vl_model
 
-    has_cuda = torch.cuda.is_available()
-    model_dtype = torch.float16 if has_cuda else torch.float32
-    bnb_config = (
-        BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-        )
-        if has_cuda
-        else None
-    )
-
-    _vision_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        VISION_MODEL_ID,
-        quantization_config=bnb_config,
-        dtype=model_dtype,
-        device_map="auto" if has_cuda else None,
-        low_cpu_mem_usage=True,
-    )
-    _vision_processor = AutoProcessor.from_pretrained(
-        VISION_MODEL_ID,
-        min_pixels=MIN_PIXELS,
-        max_pixels=MAX_PIXELS,
-    )
+    _vision_model, _vision_processor = load_qwen_vl_model()
     return _vision_model, _vision_processor
 
 
@@ -73,20 +43,6 @@ def get_places_from_db(db_path: str = DB_PATH) -> list[dict]:
     rows = [dict(row) for row in cursor.fetchall()]
     conn.close()
     return rows
-
-
-def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Calculate great-circle distance in kilometers between two GPS coordinates."""
-    r = 6371.0
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-
-    a = (
-        math.sin(dphi / 2.0) ** 2
-        + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
-    )
-    return 2.0 * r * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
 
 
 def recognize_building(
