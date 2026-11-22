@@ -1,19 +1,21 @@
-"""Lokális Qwen2.5-VL-3B-Instruct LLM szolgáltatás, JSON-validáció és pipeline logika."""
+""""Legkisebb memóriaterhelésű lokális (CLIP + Qwen2.5-0.5B) LLM és pipeline szolgáltatás."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
+import gc
 import json
 import logging
 from pathlib import Path
 import re
 from typing import Any, TypeVar
+import warnings
 
 from PIL import Image
 from pydantic import BaseModel, ValidationError
 
-from audio_processor import transcribe_audio
+from audio_processor import clear_whisper_cache, transcribe_audio
 from location import get_image_coordinates
 from schemas import ImageCheckResult, PipelineResult, TouristResponse
 from validator import (
@@ -28,12 +30,12 @@ from validator import (
     is_place_open,
 )
 
-VISION_MODEL_ID: str = "Qwen/Qwen2.5-VL-3B-Instruct"
-MIN_PIXELS: int = 256 * 28 * 28
-MAX_PIXELS: int = 512 * 28 * 28
-LANDMARK_CONFIDENCE_THRESHOLD: float = 0.6
+CLIP_MODEL_ID: str = "openai/clip-vit-base-patch32"
+TEXT_MODEL_ID: str = "Qwen/Qwen2.5-0.5B-Instruct"
+
+LANDMARK_CONFIDENCE_THRESHOLD: float = 0.25
 DEFAULT_MAX_JSON_RETRIES: int = 1
-DEFAULT_MAX_CLOSED_RETRIES: int = 2
+DEFAULT_MAX_CLOSED_RETRIES: int = 1
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -42,10 +44,30 @@ _CODE_FENCE_PATTERN = re.compile(
     flags=re.DOTALL | re.IGNORECASE,
 )
 
-_qwen_model: Any = None
-_qwen_processor: Any = None
-_loaded_model_config: tuple[str, bool] | None = None
-_default_llm_service: LocalQwenVLService | None = None
+_PLACE_CLIP_HINTS: dict[str, str] = {
+    "országház": "Hungarian Parliament Building by the Danube in Budapest",
+    "parlament": "Hungarian Parliament Building by the Danube in Budapest",
+    "lánchíd": "Szechenyi Chain Bridge suspension bridge over the Danube in Budapest",
+    "széchenyi lánchíd": "Szechenyi Chain Bridge suspension bridge over the Danube in Budapest",
+    "halászbástya": "Fisherman's Bastion neo-Gothic terraces in Budapest",
+    "budai vár": "Buda Castle royal palace in Budapest",
+    "mátyás templom": "Matthias Church gothic church in Budapest",
+    "hősök tere": "Heroes' Square memorial columns in Budapest",
+    "szent istván-bazilika": "St. Stephen's Basilica dome in Budapest",
+    "szent istván bazilika": "St. Stephen's Basilica dome in Budapest",
+    "citadella": "Citadella fortress on Gellert Hill in Budapest",
+    "margitsziget": "Margaret Island park and water tower in Budapest",
+}
+
+_clip_model: Any = None
+_clip_processor: Any = None
+_loaded_clip_model_id: str | None = None
+
+_text_model: Any = None
+_text_tokenizer: Any = None
+_loaded_text_model_id: str | None = None
+
+_default_text_service: LocalTextLLMService | None = None
 
 
 class StructuredOutputError(ValueError):
@@ -62,12 +84,7 @@ class StructuredOutputError(ValueError):
         self.last_error = last_error
 
 
-def clear_qwen_cache() -> None:
-    """Felszabadítja a betöltött Qwen2.5-VL modellt és a CUDA gyorsítótárat."""
-    global _qwen_model, _qwen_processor, _loaded_model_config
-    _qwen_model = None
-    _qwen_processor = None
-    _loaded_model_config = None
+def _empty_torch_cache_and_gc() -> None:
     try:
         import torch
 
@@ -75,135 +92,167 @@ def clear_qwen_cache() -> None:
             torch.cuda.empty_cache()
     except ImportError:  # pragma: no cover
         pass
+    gc.collect()
 
 
-def load_qwen_vl_model(
-    model_id: str = VISION_MODEL_ID,
-    use_4bit: bool = True,
+def clear_clip_cache() -> None:
+    """Felszabadítja a betöltött CLIP modellt és a gyorsítótárakat."""
+    global _clip_model, _clip_processor, _loaded_clip_model_id
+    _clip_model = None
+    _clip_processor = None
+    _loaded_clip_model_id = None
+    _empty_torch_cache_and_gc()
+
+
+def clear_qwen_cache() -> None:
+    """Kompatibilitási név: üríti a gyorsítótárakat és futtatja a garbage collectort."""
+    clear_clip_cache()
+
+
+def clear_text_llm_cache() -> None:
+    """Felszabadítja a betöltött szöveges LLM modellt és a gyorsítótárakat."""
+    global _text_model, _text_tokenizer, _loaded_text_model_id
+    _text_model = None
+    _text_tokenizer = None
+    _loaded_text_model_id = None
+    _empty_torch_cache_and_gc()
+
+
+def load_clip_model(
+    model_id: str = CLIP_MODEL_ID,
 ) -> tuple[Any, Any]:
-    """Lustán betölti és singletonként gyorsítótárazza a Qwen2.5-VL-3B-Instruct modellt."""
-    global _qwen_model, _qwen_processor, _loaded_model_config
+    """Lustán betölti a kis CLIP modellt a látványosság-ellenőrzéshez."""
+    global _clip_model, _clip_processor, _loaded_clip_model_id
 
     if (
-        _qwen_model is not None
-        and _qwen_processor is not None
-        and _loaded_model_config == (model_id, use_4bit)
+        _clip_model is not None
+        and _clip_processor is not None
+        and _loaded_clip_model_id == model_id
     ):
-        return _qwen_model, _qwen_processor
+        return _clip_model, _clip_processor
 
-    if _qwen_model is not None:
-        clear_qwen_cache()
+    if _clip_model is not None:
+        clear_clip_cache()
 
-    import warnings
     logging.getLogger("torch.utils.flop_counter").setLevel(logging.ERROR)
     import torch
-    from transformers import (
-        AutoProcessor,
-        BitsAndBytesConfig,
-        Qwen2_5_VLForConditionalGeneration,
-        logging as hf_logging,
-    )
+    from transformers import CLIPModel, CLIPProcessor, logging as hf_logging
 
     warnings.filterwarnings("ignore", category=UserWarning)
     hf_logging.set_verbosity_error()
 
     has_cuda = torch.cuda.is_available()
-    if has_cuda:
-        use_bf16 = (not use_4bit) and torch.cuda.is_bf16_supported()
-        model_dtype = torch.bfloat16 if use_bf16 else torch.float16
-    else:
-        model_dtype = torch.float32
+    model_dtype = torch.float16 if has_cuda else torch.float32
 
-    bnb_config = (
-        BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-        )
-        if has_cuda and use_4bit
-        else None
-    )
-
-    _qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    _clip_processor = CLIPProcessor.from_pretrained(model_id)
+    _clip_model = CLIPModel.from_pretrained(
         model_id,
-        quantization_config=bnb_config,
         dtype=model_dtype,
         device_map="auto" if has_cuda else None,
         low_cpu_mem_usage=True,
     )
-    _qwen_processor = AutoProcessor.from_pretrained(
+    _clip_model.eval()
+    _loaded_clip_model_id = model_id
+    return _clip_model, _clip_processor
+
+
+def load_text_llm_model(
+    model_id: str = TEXT_MODEL_ID,
+) -> tuple[Any, Any]:
+    """Lustán betölti a legkisebb szöveges Qwen2.5-0.5B modellt."""
+    global _text_model, _text_tokenizer, _loaded_text_model_id
+
+    if (
+        _text_model is not None
+        and _text_tokenizer is not None
+        and _loaded_text_model_id == model_id
+    ):
+        return _text_model, _text_tokenizer
+
+    if _text_model is not None:
+        clear_text_llm_cache()
+
+    logging.getLogger("torch.utils.flop_counter").setLevel(logging.ERROR)
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer, logging as hf_logging
+
+    warnings.filterwarnings("ignore", category=UserWarning)
+    hf_logging.set_verbosity_error()
+
+    has_cuda = torch.cuda.is_available()
+    model_dtype = torch.float16 if has_cuda else torch.float32
+
+    _text_tokenizer = AutoTokenizer.from_pretrained(model_id)
+    _text_model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        size={"shortest_edge": MIN_PIXELS, "longest_edge": MAX_PIXELS},
+        dtype=model_dtype,
+        device_map="auto" if has_cuda else None,
+        low_cpu_mem_usage=True,
     )
-    _loaded_model_config = (model_id, use_4bit)
-    return _qwen_model, _qwen_processor
+    _text_model.eval()
+    _loaded_text_model_id = model_id
+    return _text_model, _text_tokenizer
 
 
-class LocalQwenVLService:
-    """Lokális Qwen2.5-VL-3B-Instruct modellhívásokat kezelő szolgáltatás (Ollama nélkül)."""
+class LocalTextLLMService:
+    """Könnyű lokális szöveges LLM szolgáltatás JSON/útiterv generáláshoz."""
 
-    def __init__(
-        self,
-        model_id: str = VISION_MODEL_ID,
-        use_4bit: bool = True,
-    ) -> None:
+    def __init__(self, model_id: str = TEXT_MODEL_ID) -> None:
         self.model_id = model_id
-        self.use_4bit = use_4bit
 
     def generate(
         self,
         messages: list[dict[str, Any]],
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 160,
     ) -> str:
-        """Szöveges vagy multimodális választ generál a lokális Qwen2.5-VL modellel."""
-        from qwen_vl_utils import process_vision_info
+        """Szöveges választ generál kis tokenlimittel és alacsony RAM-igénnyel."""
         import torch
 
-        model, processor = load_qwen_vl_model(
-            model_id=self.model_id,
-            use_4bit=self.use_4bit,
-        )
-        text = processor.apply_chat_template(
-            messages,
+        model, tokenizer = load_text_llm_model(model_id=self.model_id)
+
+        normalized_messages: list[dict[str, str]] = []
+        for msg in messages:
+            role = str(msg.get("role", "user"))
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                text_parts = [
+                    str(item.get("text", ""))
+                    for item in content
+                    if isinstance(item, dict) and item.get("type") == "text"
+                ]
+                joined_text = "\n".join(part for part in text_parts if part).strip()
+                normalized_messages.append({"role": role, "content": joined_text})
+            else:
+                normalized_messages.append({"role": role, "content": str(content)})
+
+        prompt_text = tokenizer.apply_chat_template(
+            normalized_messages,
             tokenize=False,
             add_generation_prompt=True,
         )
-        image_inputs, video_inputs = process_vision_info(messages)
-
         target_device = "cuda" if torch.cuda.is_available() else "cpu"
-        inputs = processor(
-            text=[text],
-            images=image_inputs or None,
-            videos=video_inputs or None,
-            padding=True,
-            return_tensors="pt",
-        ).to(target_device)
+        model_inputs = tokenizer([prompt_text], return_tensors="pt").to(target_device)
 
         with torch.inference_mode():
             generated_ids = model.generate(
-                **inputs,
+                **model_inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
             )
 
-        generated_ids_trimmed = [
+        trimmed_ids = [
             out_ids[len(in_ids) :]
-            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            for in_ids, out_ids in zip(model_inputs.input_ids, generated_ids)
         ]
-        return processor.batch_decode(
-            generated_ids_trimmed,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )[0].strip()
+        return tokenizer.batch_decode(trimmed_ids, skip_special_tokens=True)[0].strip()
 
 
-def get_default_llm_service() -> LocalQwenVLService:
-    """Visszaadja az alapértelmezett singleton LocalQwenVLService példányt."""
-    global _default_llm_service
-    if _default_llm_service is None:
-        _default_llm_service = LocalQwenVLService()
-    return _default_llm_service
+def get_default_text_llm_service() -> LocalTextLLMService:
+    """Visszaadja az alapértelmezett singleton LocalTextLLMService példányt."""
+    global _default_text_service
+    if _default_text_service is None:
+        _default_text_service = LocalTextLLMService()
+    return _default_text_service
 
 
 def _extract_balanced_json_candidates(text: str) -> list[str]:
@@ -348,12 +397,12 @@ def generate_structured_response(
     response_model: type[T],
     generate_fn: Callable[[list[dict[str, Any]]], str] | None = None,
     max_json_retries: int = DEFAULT_MAX_JSON_RETRIES,
-    max_new_tokens: int = 512,
+    max_new_tokens: int = 160,
 ) -> T:
-    """Meghívja a modellt és validálja a JSON választ, hibás JSON esetén újrapróbálja."""
+    """Meghívja a kis szöveges modellt és validálja a JSON választ."""
     current_messages = list(messages)
     caller = generate_fn or (
-        lambda msgs: get_default_llm_service().generate(
+        lambda msgs: get_default_text_llm_service().generate(
             msgs, max_new_tokens=max_new_tokens
         )
     )
@@ -365,24 +414,13 @@ def generate_structured_response(
             return validate_json_response(raw_output, response_model)
         except (ValueError, ValidationError) as exc:
             if attempt < max_json_retries:
-                is_schema_echo = (
-                    '"properties"' in raw_output and '"type"' in raw_output
-                )
-                extra_hint = (
-                    "HIBA: A JSON séma definícióját küldted vissza a kitöltött válasz helyett! "
-                    "Ne használd a 'properties', 'required', 'title', 'type' kulcsokat! "
-                    if is_schema_echo
-                    else ""
-                )
                 current_messages.append({"role": "assistant", "content": raw_output})
                 current_messages.append(
                     {
                         "role": "user",
                         "content": (
-                            f"{extra_hint}"
-                            f"A válaszod nem érvényes JSON vagy nem felel meg az elvárt mezőknek ({exc}). "
-                            "Kérlek, kizárólag egyetlen kitöltött érvényes JSON objektumot adj vissza "
-                            "pontosan ezekkel a kulcsokkal, minden egyéb szöveg nélkül:\n"
+                            f"Érvénytelen JSON ({exc}). Csak egy kitöltött JSON objektumot adj vissza "
+                            "minden egyéb szöveg nélkül:\n"
                             f"{example_json}"
                         ),
                     }
@@ -427,56 +465,99 @@ def _open_rgb_image(image_source: str | Path | Image.Image) -> Image.Image:
     return image_source.convert("RGB")
 
 
+def _place_to_clip_prompt(place_name: str) -> str:
+    """Angol + budapesti kontextust ad a CLIP promptnak a pontosabb felismeréshez."""
+    cleaned = " ".join(place_name.lower().strip().split())
+    if cleaned in _PLACE_CLIP_HINTS:
+        return f"a clear photograph of {_PLACE_CLIP_HINTS[cleaned]}"
+    for key, hint in _PLACE_CLIP_HINTS.items():
+        if key in cleaned:
+            return f"a clear photograph of {hint}"
+    return f"a clear photograph of {place_name}, a landmark in Hungary"
+
+
 def check_image_landmark(
     image_source: str | Path | Image.Image,
     generate_fn: Callable[[list[dict[str, Any]]], str] | None = None,
     max_json_retries: int = DEFAULT_MAX_JSON_RETRIES,
     known_places: list[str] | None = None,
 ) -> ImageCheckResult:
-    """Ellenőrzi a Qwen2.5-VL modellel, hogy a képen látványosság szerepel-e."""
-    image_pil = _open_rgb_image(image_source)
-    system_prompt = build_json_system_prompt(
-        ImageCheckResult,
-        "Te egy vizuális látványosság-ellenőrző modul vagy. Elemezd a képet, és döntsd el, "
-        "hogy valódi turisztikai látványosság vagy nevezetesség látható-e rajta.",
-    )
-    places_hint = ""
-    if known_places:
-        places_hint = (
-            "\nHa a képen az alábbi ismert nevezetességek egyike látható, "
-            "a detected_name mezőben lehetőség szerint a pontos nevét add meg: "
-            + ", ".join(known_places)
-            + " (ha viszont nem látványosság látható a képen, az is_landmark legyen false)."
+    """Könnyű CLIP-alapú látványosság-ellenőrzés a 3B-s VL modell kihagyásával."""
+    if generate_fn is not None:
+        image_pil = _open_rgb_image(image_source)
+        system_prompt = build_json_system_prompt(
+            ImageCheckResult,
+            "Döntsd el, hogy a képen turisztikai látványosság látható-e.",
         )
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "image": image_pil,
-                    "min_pixels": MIN_PIXELS,
-                    "max_pixels": MAX_PIXELS,
-                },
-                {
-                    "type": "text",
-                    "text": (
-                        "Vizsgáld meg a képet! Add meg az is_landmark (bool), "
-                        "a confidence (0.0 és 1.0 között), a detected_name "
-                        "(a látványosság neve vagy null) és a reason (rövid magyar indoklás) mezőket."
-                        f"{places_hint}"
-                    ),
-                },
-            ],
-        },
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image_pil},
+                    {"type": "text", "text": "Látványosság látható a képen?"},
+                ],
+            },
+        ]
+        return generate_structured_response(
+            messages=messages,
+            response_model=ImageCheckResult,
+            generate_fn=generate_fn,
+            max_json_retries=max_json_retries,
+            max_new_tokens=96,
+        )
+
+    import torch
+
+    image_pil = _open_rgb_image(image_source).resize((224, 224))
+    model, processor = load_clip_model(CLIP_MODEL_ID)
+
+    place_candidates = [p.strip() for p in (known_places or []) if p and p.strip()]
+    non_landmark_labels = [
+        "a blurry photo of everyday clutter, a blank screen, or a random close-up object",
+        "not a tourist landmark or building",
     ]
-    return generate_structured_response(
-        messages=messages,
-        response_model=ImageCheckResult,
-        generate_fn=generate_fn,
-        max_json_retries=max_json_retries,
-        max_new_tokens=256,
+    landmark_prompts = [_place_to_clip_prompt(name) for name in place_candidates] + [
+        *non_landmark_labels,
+    ]
+    non_landmark_start_idx = len(place_candidates)
+
+    target_device = "cuda" if torch.cuda.is_available() else "cpu"
+    inputs = processor(
+        text=landmark_prompts,
+        images=image_pil,
+        return_tensors="pt",
+        padding=True,
+    ).to(target_device)
+
+    with torch.inference_mode():
+        outputs = model(**inputs)
+        probs = outputs.logits_per_image.softmax(dim=1)[0].detach().cpu().tolist()
+
+    best_idx = max(range(len(probs)), key=lambda i: probs[i])
+    best_prob = float(probs[best_idx])
+    is_non_landmark = best_idx >= non_landmark_start_idx
+
+    detected_name: str | None = None
+    if not is_non_landmark and best_idx < len(place_candidates):
+        detected_name = place_candidates[best_idx]
+
+    is_landmark = (
+        (not is_non_landmark)
+        and (detected_name is not None)
+        and (best_prob >= LANDMARK_CONFIDENCE_THRESHOLD)
+    )
+    reason = (
+        f"CLIP legjobb találat: {detected_name or 'ismeretlen látványosság'} ({best_prob:.0%})."
+        if is_landmark
+        else f"CLIP szerint nem egyértelmű látványosság ({best_prob:.0%})."
+    )
+
+    return ImageCheckResult(
+        is_landmark=is_landmark,
+        confidence=round(best_prob, 4),
+        detected_name=detected_name,
+        reason=reason,
     )
 
 
@@ -491,7 +572,7 @@ def generate_tourist_response_with_opening_check(
     max_json_retries: int = DEFAULT_MAX_JSON_RETRIES,
     origin_coords: tuple[float, float] | None = None,
 ) -> tuple[TouristResponse, bool, str, int]:
-    """Útitervet generál nyitvatartás-ellenőrzéssel és távolság szerinti visszacsatolási hurokkal."""
+    """Útitervet generál nyitvatartás-ellenőrzéssel és visszacsatolási hurokkal."""
     check_time = current_time or datetime.now()
     current_messages = list(messages)
     rejected_places: set[str] = set()
@@ -502,6 +583,7 @@ def generate_tourist_response_with_opening_check(
             response_model=TouristResponse,
             generate_fn=generate_fn,
             max_json_retries=max_json_retries,
+            max_new_tokens=160,
         )
         is_open, status_msg = is_place_open(
             response.ajanlott_kovetkezo_megallo,
@@ -618,6 +700,9 @@ def run_tourist_pipeline(
         max_json_retries=max_json_retries,
         known_places=known_place_names,
     )
+    if generate_fn is None:
+        clear_clip_cache()
+
     passed, guardrail_msg = evaluate_image_guardrail(image_check)
     if not passed:
         return PipelineResult(
@@ -631,6 +716,8 @@ def run_tourist_pipeline(
     transcript: dict[str, str] | None = None
     if audio_path:
         transcript = transcribe_audio(audio_path, device=whisper_device)
+        clear_whisper_cache()
+        gc.collect()
 
     effective_coords = coords
     if effective_coords is None:
@@ -693,85 +780,53 @@ def run_tourist_pipeline(
                 exclude_id=matched_place["id"] if matched_place else None,
             )
 
-        for idx, place in enumerate(same_category_places, start=1):
+        for idx, place in enumerate(same_category_places[:3], start=1):
             if "distance_km" in place:
                 candidate_lines.append(
-                    f"{idx}. {place['name']} | távolság: {place['distance_km']:.2f} km "
-                    f"(kb. {place['estimated_walk_minutes']} perc séta) | "
-                    f"jegyár: {place['ticket_price_huf']} Ft | {place['description']}"
+                    f"{idx}. {place['name']} | {place['distance_km']:.2f} km "
+                    f"({place['estimated_walk_minutes']} perc)"
                 )
             else:
-                candidate_lines.append(
-                    f"{idx}. {place['name']} | jegyár: {place['ticket_price_huf']} Ft | "
-                    f"{place['description']}"
-                )
+                candidate_lines.append(f"{idx}. {place['name']}")
 
     context_parts = [
-        f"Aktuális időpont: {time_label}",
-        f"Felismert helyszín: {place_name}",
+        f"Időpont: {time_label}",
+        f"Helyszín: {place_name}",
     ]
     if matched_place:
         context_parts.append(
-            f"Adatbázis adatok: kategória={matched_place['category']}, "
-            f"jegyár={matched_place['ticket_price_huf']} Ft, "
-            f"leírás={matched_place['description']}"
+            f"Kategória: {matched_place['category']}, jegyár: {matched_place['ticket_price_huf']} Ft"
         )
-    if transcript:
-        context_parts.append(
-            f"A turista hangüzenete ({transcript['language']}): '{transcript['text']}'"
-        )
+    if transcript and transcript.get("text"):
+        context_parts.append(f"Kérdés: '{transcript['text']}'")
     if user_text:
-        context_parts.append(f"A turista szöveges megjegyzése: '{user_text}'")
+        context_parts.append(f"Megjegyzés: '{user_text}'")
     if candidate_lines:
-        context_parts.append(
-            "Ugyanabba a kategóriába tartozó választható következő megállók távolság "
-            "szerinti sorrendben (1. a legközelebbi):\n" + "\n".join(candidate_lines)
-        )
+        context_parts.append("Következő jelöltek:\n" + "\n".join(candidate_lines))
 
-    image_pil = _open_rgb_image(image_source)
     system_prompt = build_json_system_prompt(
         TouristResponse,
-        "Te egy profi magyar idegenvezető asszisztens vagy. Készíts pontos, "
-        "szórakoztató és megbízható választ a képen látható nevezetességről. "
-        "A következő megálló kiválasztásánál MINDIG a távolság az elsődleges szempont: "
-        "először a legközelebbi látványosságot válaszd a megadott listából! "
-        "Ha a rendszer később jelzi, hogy a kiválasztott hely zárva van, "
-        "akkor válaszd a megadott nyitva tartó lista legelső (legközelebbi) elemét!",
+        "Magyar idegenvezető asszisztens vagy. Válaszolj tömören, pontos JSON-nal. "
+        "Mindig a legközelebbi megállót válaszd a jelöltek közül.",
     )
 
     closest_instruction = ""
     if same_category_places and "distance_km" in same_category_places[0]:
         closest_place = same_category_places[0]
         closest_instruction = (
-            f"\nA legközelebbi jelölt a listában az 1. helyen szereplő "
-            f"'{closest_place['name']}' ({closest_place['distance_km']:.2f} km, "
-            f"kb. {closest_place['estimated_walk_minutes']} perc séta) – elsőként ezt válaszd "
-            f"az `ajanlott_kovetkezo_megallo` mezőbe, a `becsult_ido_percben` értéke pedig "
-            f"legyen {closest_place['estimated_walk_minutes']}!"
+            f"\nLegközelebbi megálló: '{closest_place['name']}', "
+            f"becsult_ido_percben: {closest_place['estimated_walk_minutes']}."
         )
 
     user_prompt = (
-        "\n\n".join(context_parts)
+        "\n".join(context_parts)
         + closest_instruction
-        + "\n\nVálaszolj pontosan egy kitöltött JSON objektummal, amely tartalmazza a "
-        "`felismert_hely`, `tortenelem_roviden`, `ajanlott_kovetkezo_megallo`, "
-        "`becsult_ido_percben` és `megjegyzes` mezőket magyar nyelvű értékekkel!"
+        + "\nAdd meg a JSON mezőket magyarul."
     )
 
     itinerary_messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "image": image_pil,
-                    "min_pixels": MIN_PIXELS,
-                    "max_pixels": MAX_PIXELS,
-                },
-                {"type": "text", "text": user_prompt},
-            ],
-        },
+        {"role": "user", "content": user_prompt},
     ]
 
     tourist_response, is_open, status_msg, attempts = (
