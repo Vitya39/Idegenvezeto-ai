@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover
     whisper = None
 
 SUPPORTED_AUDIO_EXTENSIONS: frozenset[str] = frozenset({".wav", ".mp3", ".m4a"})
-DEFAULT_WHISPER_MODEL: str = "small"
+DEFAULT_WHISPER_MODEL: str = "tiny"
 HUNGARIAN_TOURISM_PROMPT: str = (
     "Turisztikai asszisztens, nevezetességek: Országház, Halászbástya, "
     "Széchenyi Lánchíd, Szent István-bazilika, Széchenyi Gyógyfürdő, "
